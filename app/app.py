@@ -62,6 +62,59 @@ RAM_GB = psutil.virtual_memory().total / 2**30
 # (height, width) buckets with real training mass; rarer training buckets show artifacts
 SIZES = {f"{w}×{h}": (h, w) for h, w in [(768, 1344), (832, 1280), (896, 1152), (1024, 1024),
                                           (1152, 896), (1280, 832), (1344, 768)]}
+CUSTOM = "Custom…"
+MAX_PIXELS = 1024 * 1024  # trained at ~1 MP; larger sizes break up into a 16 px block grid
+MIN_SIDE, MAX_RATIO = 256, 4.0  # training buckets span 1:4 to 4:1
+
+
+def fit_size(width, height) -> tuple[int, int]:
+    """(height, width) for a requested size: multiples of 16, aspect clamped to 1:4..4:1, no bigger than
+    the request and no bigger than the model's ~1 MP budget. Picks the largest size within 1% of the
+    requested aspect ratio (or the closest ratio if none is)."""
+    width, height = max(float(width or 0), 1.0), max(float(height or 0), 1.0)
+    ratio = min(max(width / height, 1 / MAX_RATIO), MAX_RATIO)
+    budget = min(max(width * height, MIN_SIDE * MIN_SIDE * max(ratio, 1 / ratio)), MAX_PIXELS)
+    best = None
+    for h in range(16, 4097, 16):
+        for w in {math.floor(h * ratio / 16) * 16, math.ceil(h * ratio / 16) * 16}:
+            if w < 16 or w * h > budget:
+                continue
+            err = abs(math.log((w / h) / ratio))
+            key = (err > 0.01, -w * h if err <= 0.01 else err)
+            if best is None or key < best[0]:
+                best = (key, h, w)
+    return best[1], best[2]
+
+
+def resolve_size(size, width, height) -> tuple[int, int]:
+    return fit_size(width, height) if size == CUSTOM else SIZES[size]
+
+
+def aspect_size(width, height) -> tuple[int, int]:
+    """(height, width): the largest clean size (~1 MP) with the same aspect ratio as width × height."""
+    grow = math.sqrt(MAX_PIXELS / max(width * height, 1))
+    return fit_size(width * max(grow, 1.0), height * max(grow, 1.0))
+
+
+def aspect_note(image, keep) -> str:
+    if image is None or not keep:
+        return ""
+    h, w = aspect_size(image.width, image.height)
+    return (f"Init image is {image.width}×{image.height} → generates at **{w}×{h}** "
+            f"({w * h / 1e6:.2f} MP); the Size setting above is ignored.")
+
+
+def size_note(size, width, height) -> str:
+    if size != CUSTOM:
+        return ""
+    h, w = resolve_size(size, width, height)
+    note = f"Generates at **{w}×{h}** ({w * h / 1e6:.2f} MP, {w / h:.2f}:1)."
+    if (w, h) != (int(width or 0), int(height or 0)):
+        note += (" That is the largest size for this aspect ratio the model renders cleanly (~1 MP, "
+                 "multiples of 16). For a bigger image use **Send to Upscale**.")
+    return note
+
+
 PALETTES = ["inferno", "magma", "viridis", "plasma", "turbo", "Spectral", "gray"]
 
 # ---------------------------------------------------------------------------------------------
@@ -332,11 +385,14 @@ def sample_one(t2i: T2I, cond, cond_mask, uncond, null_mask, height, width, step
 
 
 def run_t2i(prompt, negative, size, steps, cfg_scale, seed, randomize, count, init_image, strength,
-            progress=gr.Progress()):
+            width=1024, height=1024, keep_aspect=True, progress=gr.Progress()):
     if not prompt.strip():
         raise gr.Error("Write a prompt first.")
     STOP.clear()
-    height, width = SIZES[size]
+    if init_image is not None and keep_aspect:
+        height, width = aspect_size(init_image.width, init_image.height)
+    else:
+        height, width = resolve_size(size, width, height)
     seed = random.randint(0, 2**31 - 1) if randomize else int(seed)
     images, paths = [], []
     with GPU_LOCK:
@@ -363,7 +419,7 @@ def run_t2i(prompt, negative, size, steps, cfg_scale, seed, randomize, count, in
             if STOP.is_set():
                 break
             image = to_pil(x)
-            meta = {"prompt": prompt, "negative_prompt": negative, "size": size, "steps": int(steps),
+            meta = {"prompt": prompt, "negative_prompt": negative, "size": f"{width}×{height}", "steps": int(steps),
                     "cfg": cfg_scale, "seed": this_seed, "model": "speridlabs/iris-3b"}
             if init is not None:
                 meta["img2img_strength"] = strength
@@ -524,6 +580,12 @@ footer { display: none !important; }
 #hero h1 { margin-bottom: 0; }
 #hero p { margin-top: 4px; opacity: .8; }
 .presets .caption-label { display: none; }
+.size-note { padding: 8px 12px 10px; }
+.size-note p, .aspect-note p { margin: 0; }
+.aspect-note { padding: 0 4px; }
+/* size controls locked by "Keep init image's aspect ratio": make the disabled state obvious */
+.lockable:has(input:disabled), button.lockable:disabled { opacity: .4; filter: grayscale(1); }
+.lockable:has(input:disabled) *, button.lockable:disabled { cursor: not-allowed !important; }
 """
 
 HERO = """
@@ -551,8 +613,16 @@ with gr.Blocks(title="Iris-3B Studio", css=CSS + VIEWER_CSS, head=HEAD_JS,
                         gen_btn = gr.Button("Generate", variant="primary", scale=3)
                         stop_btn = gr.Button("Stop", variant="stop", scale=1)
                     with gr.Row():
-                        size = gr.Dropdown(list(SIZES), value=first["size"], label="Size (width × height)")
+                        size = gr.Dropdown(list(SIZES) + [CUSTOM], value=first["size"], label="Size (width × height)",
+                                           elem_classes="lockable")
                         count = gr.Slider(1, 8, value=1, step=1, label="Images")
+                    with gr.Group(visible=False, elem_classes="custom-size") as custom_box:
+                        with gr.Row(equal_height=True):
+                            custom_w = gr.Number(value=2560, precision=0, minimum=16, label="Width", elem_classes="lockable")
+                            custom_h = gr.Number(value=1080, precision=0, minimum=16, label="Height",
+                                                 elem_classes="lockable")
+                        match_btn = gr.Button("Match init image", size="sm", elem_classes="lockable")
+                        custom_note = gr.Markdown(size_note(CUSTOM, 2560, 1080), elem_classes="size-note")
                     with gr.Accordion("Settings", open=True):
                         negative = gr.Textbox(label="Negative prompt", value="")
                         steps = gr.Slider(10, 150, value=50, step=1, label="Steps",
@@ -564,11 +634,18 @@ with gr.Blocks(title="Iris-3B Studio", css=CSS + VIEWER_CSS, head=HEAD_JS,
                     with gr.Accordion("Image to image (experimental)", open=False):
                         gr.Markdown("Starts sampling from your image instead of pure noise. Iris has **no trained "
                                     "image conditioning**; this is noise-and-denoise in pixel space, the same "
-                                    "approach as ComfyUI-iris. The image is cover-cropped to the chosen size.")
+                                    "approach as ComfyUI-iris. With *Keep aspect ratio* off, the image is cover-cropped "
+                                    "to the chosen size.")
                         init_image = gr.Image(type="pil", label="Init image (leave empty for text-to-image)", height=240)
                         strength = gr.Slider(0.05, 1.0, value=0.5, step=0.05, label="Strength",
                                              info="How much of the image is re-noised. 0.25 = subtle, 1.0 = ignore image. "
                                                   "Always runs the full step count above.")
+                        keep_aspect = gr.Checkbox(value=True, label="Keep init image's aspect ratio",
+                                                  info="Overrides the Size set above (preset or Custom) while an init "
+                                                       "image is loaded: generates at the largest clean size (~1 MP) with "
+                                                       "the init image's shape, so nothing is cropped. Ignored without an "
+                                                       "init image.")
+                        aspect_md = gr.Markdown("", elem_classes="aspect-note")
                 with gr.Column(scale=7):
                     gallery = gr.Gallery(value=[(str(DEMO / first["image"]), "preset")], label="Result",
                                          columns=2, height=640, object_fit="contain", format="png")
@@ -655,7 +732,32 @@ with gr.Blocks(title="Iris-3B Studio", css=CSS + VIEWER_CSS, head=HEAD_JS,
                         "(Pinokio's shared cache) and are not re-downloaded on reinstall.")
 
     # ---------------- events ----------------
-    t2i_inputs = [prompt, negative, size, steps, cfg_scale, seed, randomize, count, init_image, strength]
+    t2i_inputs = [prompt, negative, size, steps, cfg_scale, seed, randomize, count, init_image, strength,
+                  custom_w, custom_h, keep_aspect]
+    def lock_size(image, keep, size_value, width, height):
+        # the init image's shape overrides Size: grey the size controls out while that is the case
+        locked = image is not None and keep
+        free = gr.update(interactive=not locked)
+        note = ("Size is set by the init image while *Keep init image's aspect ratio* is on "
+                "(see Image to image below)." if locked else size_note(size_value, width, height))
+        return aspect_note(image, keep), free, free, free, free, note
+
+    for comp in (init_image, keep_aspect):
+        comp.change(lock_size, [init_image, keep_aspect, size, custom_w, custom_h],
+                    [aspect_md, size, custom_w, custom_h, match_btn, custom_note],
+                    api_name=False, queue=False, show_progress="hidden")
+    size.change(lambda s: gr.Group(visible=s == CUSTOM), size, custom_box, api_name=False, queue=False)
+    for comp in (size, custom_w, custom_h):
+        comp.change(size_note, [size, custom_w, custom_h], custom_note, api_name=False, queue=False,
+                    show_progress="hidden")
+
+    def match_init(image):
+        if image is None:
+            gr.Warning("Add an init image first (Image to image section).")
+            return gr.update(), gr.update(), gr.update()
+        return CUSTOM, image.width, image.height
+
+    match_btn.click(match_init, init_image, [size, custom_w, custom_h], api_name=False, queue=False)
     gen_evt = gen_btn.click(run_t2i, t2i_inputs, [gallery, seed, gen_info, last_path], api_name="generate")
     sub_evt = prompt.submit(run_t2i, t2i_inputs, [gallery, seed, gen_info, last_path], api_name=False)
     stop_btn.click(lambda: STOP.set(), None, None, queue=False, api_name=False)
