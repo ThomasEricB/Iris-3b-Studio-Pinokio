@@ -1,0 +1,12 @@
+# Inference-only dependencies of speridlabs/iris-3b (its training-only deps, dion and wandb,
+# are skipped: the package itself is installed with --no-deps). PyTorch comes from torch.js.
+transformers>=4.57.0
+accelerate>=1.2
+omegaconf>=2.3
+safetensors>=0.4
+huggingface_hub>=0.26
+pillow>=10.0
+numpy>=1.26
+matplotlib>=3.8
+gradio>=5.49,<6
+psutil

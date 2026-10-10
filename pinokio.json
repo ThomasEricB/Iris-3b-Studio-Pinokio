@@ -1,0 +1,5 @@
+{
+  "title": "Iris-3B Studio",
+  "description": "Speridlabs Iris-3B pixel-space diffusion: text-to-image, monocular depth, and image restoration / 4x upscaling in one local Gradio UI. NVIDIA GPU recommended (16 GB+); Apple Silicon and CPU work but are slow.",
+  "icon": "icon.png"
+}

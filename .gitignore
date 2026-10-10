@@ -1,0 +1,10 @@
+# created by install.js / at runtime
+app/env/
+app/iris-3b/
+app/output/
+app/outputs/
+app/settings.json
+logs/
+__pycache__/
+*.pyc
+.DS_Store
