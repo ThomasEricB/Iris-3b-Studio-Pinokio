@@ -301,31 +301,33 @@ def sample_one(t2i: T2I, cond, cond_mask, uncond, null_mask, height, width, step
 
     solver = FlowDPMSolver(model_fn, num_timesteps=cfg.flow.num_train_timesteps, cfg_scale=cfg_scale,
                            cfg_interval=tuple(cfg.sample.cfg_interval), prediction=cfg.flow.prediction)
-    grid = solver.time_grid(steps, cfg.flow.shift)
+    total = steps
+    if init is not None:
+        # pixel-space img2img: run exactly `steps` steps over the last `strength` share of a stretched
+        # schedule, so the step count you set is the step count you get
+        total = max(steps, math.floor(steps / max(strength, 1e-3) + 0.5))
+    grid = solver.time_grid(total, cfg.flow.shift)
     generator = torch.Generator(device=DEVICE).manual_seed(int(seed))
     noise = torch.randn(1, model.cfg.in_channels, height, width, generator=generator, device=DEVICE)
-    start = 0
+    start = total - steps
     if init is not None:
-        # pixel-space img2img (same rule as ComfyUI-iris): skip the noisiest part of the schedule
-        active = min(max(math.floor(strength * steps + 0.5), 1), steps)
-        start = steps - active
         sigma = grid[start]
         x = (1 - sigma) * init.float() + sigma * noise
     else:
         x = noise
     history = []
-    for i in range(start + 1, steps + 1):
+    for i in range(start + 1, total + 1):
         if STOP.is_set():
             break
         s, t = grid[i - 1], grid[i]
         x0 = solver._pred_x0(x, s, cond, uncond)
         history.append((s, x0))
-        step_order = min(i - start, cfg.sample.order, steps + 1 - i)
+        step_order = min(i - start, cfg.sample.order, total + 1 - i)
         x = solver._first_order(x, s, t, x0) if step_order == 1 else solver._second_order(x, history[-2], history[-1], t)
         if len(history) > 2:
             history.pop(0)
         if on_step:
-            on_step(i - start, steps - start, x0)
+            on_step(i - start, steps, x0)
     return x.clamp(-1, 1)[0]
 
 
@@ -565,7 +567,8 @@ with gr.Blocks(title="Iris-3B Studio", css=CSS + VIEWER_CSS, head=HEAD_JS,
                                     "approach as ComfyUI-iris. The image is cover-cropped to the chosen size.")
                         init_image = gr.Image(type="pil", label="Init image (leave empty for text-to-image)", height=240)
                         strength = gr.Slider(0.05, 1.0, value=0.5, step=0.05, label="Strength",
-                                             info="Share of the schedule that is re-sampled. 0.25 = subtle, 1.0 = ignore image.")
+                                             info="How much of the image is re-noised. 0.25 = subtle, 1.0 = ignore image. "
+                                                  "Always runs the full step count above.")
                 with gr.Column(scale=7):
                     gallery = gr.Gallery(value=[(str(DEMO / first["image"]), "preset")], label="Result",
                                          columns=2, height=640, object_fit="contain", format="png")
